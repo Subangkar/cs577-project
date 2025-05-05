@@ -7,20 +7,23 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
     AutoModelForSequenceClassification,
-    pipeline
+    pipeline,
+    MarianMTModel,
+    MarianTokenizer
 )
 from datasets import load_dataset
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
+import argparse
 import random
 
 # ------------------ Config ------------------ #
 MODEL_CONFIG = {
-    "dolly": "sshleifer/tiny-gpt2",  # Tiny GPT-2 for demo
+    "dolly": "sshleifer/tiny-gpt2",
     "gptj": "sshleifer/tiny-gpt2"
 }
-TARGET_LLM = MODEL_CONFIG["dolly"]  # Change to "gptj" if needed
+TARGET_LLM = MODEL_CONFIG["dolly"]
 PARAPHRASER_MODEL = "t5-small"
 DETECTOR_MODEL = "distilbert-base-uncased"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,7 +40,7 @@ class RadarDataset(Dataset):
     def __getitem__(self, idx):
         return self.human_texts[idx], self.ai_texts[idx]
 
-# ------------------ Generate AI-text Corpus ------------------ #
+# ------------------ Text Generation ------------------ #
 def generate_ai_corpus(human_texts, model_name, max_length=128):
     generator = pipeline("text-generation", model=model_name, device=0 if torch.cuda.is_available() else -1)
     ai_texts = []
@@ -46,6 +49,35 @@ def generate_ai_corpus(human_texts, model_name, max_length=128):
         result = generator(prompt, do_sample=True, max_length=max_length)[0]['generated_text']
         ai_texts.append(result)
     return ai_texts
+
+# ------------------ Hybrid Paraphraser Components ------------------ #
+BT_EN_TO_FR = "Helsinki-NLP/opus-mt-en-fr"
+BT_FR_TO_EN = "Helsinki-NLP/opus-mt-fr-en"
+
+bt_tokenizer_en_fr = MarianTokenizer.from_pretrained(BT_EN_TO_FR)
+bt_model_en_fr = MarianMTModel.from_pretrained(BT_EN_TO_FR).to(DEVICE)
+
+bt_tokenizer_fr_en = MarianTokenizer.from_pretrained(BT_FR_TO_EN)
+bt_model_fr_en = MarianMTModel.from_pretrained(BT_FR_TO_EN).to(DEVICE)
+
+def backtranslate(texts):
+    inputs = bt_tokenizer_en_fr(texts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(DEVICE)
+    with torch.no_grad():
+        translated = bt_model_en_fr.generate(**inputs, max_length=128)
+    fr_texts = bt_tokenizer_en_fr.batch_decode(translated, skip_special_tokens=True)
+    inputs = bt_tokenizer_fr_en(fr_texts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(DEVICE)
+    with torch.no_grad():
+        backtranslated = bt_model_fr_en.generate(**inputs, max_length=128)
+    en_texts = bt_tokenizer_fr_en.batch_decode(backtranslated, skip_special_tokens=True)
+    return en_texts
+
+def insert_filler(text):
+    fillers = ["well", "actually", "you know", "I mean", "to be honest"]
+    words = text.split()
+    if len(words) > 5:
+        idx = random.randint(1, len(words) - 2)
+        words.insert(idx, random.choice(fillers))
+    return " ".join(words)
 
 # ------------------ Reward Calculation ------------------ #
 def compute_reward(detector, tokenizer, texts):
@@ -59,7 +91,7 @@ def compute_reward(detector, tokenizer, texts):
 def normalize_rewards(rewards):
     return (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
-# ------------------ PPO-style Paraphraser Update ------------------ #
+# ------------------ PPO-style Updates ------------------ #
 def update_paraphraser(model, tokenizer, optimizer, xm, xp, adv):
     model.train()
     inputs = tokenizer(xm, return_tensors="pt", padding=True, truncation=True, max_length=128).to(DEVICE)
@@ -70,7 +102,6 @@ def update_paraphraser(model, tokenizer, optimizer, xm, xp, adv):
     loss.backward()
     optimizer.step()
 
-# ------------------ Detector Update ------------------ #
 def update_detector(detector, tokenizer, optimizer, xh, xm, xp):
     detector.train()
     texts = xh + xm + xp
@@ -93,8 +124,8 @@ def evaluate(detector, tokenizer, xh_val, xm_val):
     probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
     return roc_auc_score(labels, probs)
 
-# ------------------ RADAR Training Loop ------------------ #
-def train_radar(human_texts, ai_texts, epochs=2):
+# ------------------ Training Loop ------------------ #
+def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
     tokenizer_p = AutoTokenizer.from_pretrained(PARAPHRASER_MODEL)
     tokenizer_d = AutoTokenizer.from_pretrained(DETECTOR_MODEL)
 
@@ -119,7 +150,14 @@ def train_radar(human_texts, ai_texts, epochs=2):
         for xh, xm in tqdm(loader, desc=f"Epoch {epoch+1}"):
             inputs = tokenizer_p(xm, return_tensors="pt", padding=True, truncation=True, max_length=128).to(DEVICE)
             paraphrased_ids = paraphraser.generate(**inputs, max_length=128)
-            xp = tokenizer_p.batch_decode(paraphrased_ids, skip_special_tokens=True)
+            xp_raw = tokenizer_p.batch_decode(paraphrased_ids, skip_special_tokens=True)
+
+            if paraphraser_mode == "hybrid":
+                xp_bt = backtranslate(xp_raw)
+                xp = [insert_filler(x) for x in xp_bt]
+            else:
+                xp = xp_raw
+
             rewards = compute_reward(detector, tokenizer_d, xp)
             adv = normalize_rewards(rewards)
             buffer.append((list(xh), list(xm), xp, adv))
@@ -142,8 +180,13 @@ def train_radar(human_texts, ai_texts, epochs=2):
 
 # ------------------ Entry Point ------------------ #
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--paraphraser_mode", choices=["vanilla", "hybrid"], default="vanilla", help="Choose paraphraser type")
+    args = parser.parse_args()
+
     print("Loading WebText subset...")
-    dataset = load_dataset("openwebtext", split="train[:1%]")  # Use a small subset
-    texts = [item['text'] for item in dataset if len(item['text']) > 200][:30]  # Keep top 30 for demo
+    dataset = load_dataset("openwebtext", split="train[:1%]")
+    texts = [item['text'] for item in dataset if len(item['text']) > 200][:30]
+
     ai_corpus = generate_ai_corpus(texts, TARGET_LLM)
-    detector, paraphraser = train_radar(texts, ai_corpus, epochs=2)
+    detector, paraphraser = train_radar(texts, ai_corpus, epochs=2, paraphraser_mode=args.paraphraser_mode)
