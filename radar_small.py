@@ -1,5 +1,7 @@
 import warnings
 
+import utils
+
 warnings.filterwarnings("ignore")
 
 import os
@@ -23,6 +25,8 @@ from sklearn.metrics import roc_auc_score
 import argparse
 import random
 
+from paraphrase import paraphrase
+
 # ------------------ Config ------------------ #
 MODEL_CONFIG = {
     "dolly": "sshleifer/tiny-gpt2",
@@ -35,11 +39,13 @@ MODEL_CONFIG = {
 TARGET_LLM = MODEL_CONFIG["t5"]
 PARAPHRASER_MODEL = "t5-small"
 DETECTOR_MODEL = "distilbert-base-uncased"
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+PARAPHRASER_MODE = "vanilla"
 
-BATCH_SIZE = 16
-N_EPOCHS = 10
+BATCH_SIZE = 32
+N_EPOCHS = 20
 MAX_LENGTH = 1024
+N_SENTENCES = 5000
 
 
 # ------------------ Dataset Class ------------------ #
@@ -60,15 +66,16 @@ def generate_ai_corpus(human_texts, model_name, max_length=128):
     generator = pipeline("text2text-generation", model=model_name, framework="pt")
     ai_texts = []
     for text in tqdm(human_texts, desc="Generating AI completions"):
-        prompt = "write the following text in your own words and keep all the contents and keep the text length close to original text: " + text.strip().replace("\n", " ")
+        prompt = "write the following text in your own words and keep all the contents and keep the text length close to original text: " + text.strip().replace(
+            "\n", " ")
 
         out = generator(prompt,
-                 max_length=MAX_LENGTH,
-                 num_return_sequences=1,
-                 do_sample=False,
-                 # top_k=50,
-                 # top_p=0.95,
-                 )[0]["generated_text"]
+                        max_length=MAX_LENGTH,
+                        num_return_sequences=1,
+                        do_sample=False,
+                        # top_k=50,
+                        # top_p=0.95,
+                        )[0]["generated_text"]
         ai_texts.append(out)
     return ai_texts
 
@@ -139,6 +146,14 @@ def update_detector(detector, tokenizer, optimizer, xh, xm, xp):
     texts = xh + xm + xp
     labels = torch.tensor([0] * len(xh) + [1] * len(xm) + [1] * len(xp)).to(DEVICE)
     inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(DEVICE)
+    # print(type(inputs), inputs)
+    # exit(0)
+    # try:
+    #     outputs = detector(**inputs)
+    # except RuntimeError:
+    #     print(inputs["input_ids"].size(), inputs["attention_mask"].size())
+    #     print(texts)
+    #     exit(0)
     outputs = detector(**inputs)
     loss = nn.CrossEntropyLoss()(outputs.logits, labels)
     optimizer.zero_grad()
@@ -188,8 +203,12 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
             xp_raw = tokenizer_p.batch_decode(paraphrased_ids, skip_special_tokens=True)
 
             if paraphraser_mode == "hybrid":
-                xp_bt = backtranslate(xp_raw)
-                xp = [insert_filler(x) for x in xp_bt]
+                # print(">>", xp_raw)
+                xp = paraphrase(xp_raw)
+                # print(">>", xp)
+                # exit(0)
+                # xp_bt = backtranslate(xp_raw)
+                # xp = [insert_filler(x) for x in xp_bt]
             else:
                 xp = xp_raw
 
@@ -208,6 +227,11 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
             best_detector = detector.state_dict()
             best_paraphraser = paraphraser.state_dict()
 
+        utils.save_torch_model(detector, optimizer_d, epoch=epoch,
+                               fname=f"saved_models/detector_{PARAPHRASER_MODE}_{N_SENTENCES}_{MAX_LENGTH}_{epoch}.pth")
+        utils.save_torch_model(paraphraser, optimizer_p, epoch=epoch,
+                               fname=f"saved_models/paraphraser_{PARAPHRASER_MODE}_{N_SENTENCES}_{MAX_LENGTH}_{epoch}.pth")
+
     if best_detector and best_paraphraser:
         detector.load_state_dict(best_detector)
         paraphraser.load_state_dict(best_paraphraser)
@@ -221,19 +245,31 @@ if __name__ == '__main__':
                         help="Choose paraphraser type")
     args = parser.parse_args()
 
+    PARAPHRASER_MODE = args.paraphraser_mode
+
+    print(DEVICE)
+
     print("Loading WebText subset...")
     dataset = load_dataset("openwebtext", split="train[:1%]")
     print(len(dataset))
-    texts = [item['text'] for item in dataset if len(item['text']) < MAX_LENGTH][:100]
+    texts = [item['text'] for item in dataset if
+             len(item['text']) < MAX_LENGTH and not utils.contains_non_english_letter(item['text'])]
+
+    N_SENTENCES = min(N_SENTENCES, len(texts))
+    texts = texts[:N_SENTENCES]
+    # texts = texts[:481] + texts[483:5002]
 
     ai_corpus = generate_ai_corpus(texts, TARGET_LLM)
 
+    # print(">>", texts[:5])
+    # print(">>", ai_corpus[:5])
+
     # print(texts)
     # Save to a text file
-    with open("human_texts.txt", "w") as f:
-        for line in texts:
-            f.write("\n>> " + line.strip().replace("\n", " "))  # Add newline after each string
-    with open("ai_texts.txt", "w") as f:
-        for line in ai_corpus:
-            f.write("\n>> " + line)  # Add newline after each string
+    # with open("human_texts.txt", "w") as f:
+    #     for line in texts:
+    #         f.write("\n>> " + line.strip().replace("\n", " "))  # Add newline after each string
+    # with open("ai_texts.txt", "w") as f:
+    #     for line in ai_corpus:
+    #         f.write("\n>> " + line)  # Add newline after each string
     detector, paraphraser = train_radar(texts, ai_corpus, epochs=N_EPOCHS, paraphraser_mode=args.paraphraser_mode)
