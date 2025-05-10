@@ -1,4 +1,5 @@
 import pickle
+import traceback
 import warnings
 
 import utils
@@ -38,15 +39,16 @@ MODEL_CONFIG = {
     "t5": "ramsrigouthamg/t5_paraphraser",
 }
 TARGET_LLM = MODEL_CONFIG["t5"]
-PARAPHRASER_MODEL = "t5-small"
+PARAPHRASER_MODEL = "ramsrigouthamg/t5_paraphraser"
 DETECTOR_MODEL = "distilbert-base-uncased"
-DEVICE = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+GPU_IDS = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
 PARAPHRASER_MODE = "vanilla"
 
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 N_EPOCHS = 20
 MAX_LENGTH = 2048
-N_SENTENCES = 20000
+N_SENTENCES = 500
 
 
 # ------------------ Dataset Class ------------------ #
@@ -118,7 +120,8 @@ def insert_filler(text):
 # ------------------ Reward Calculation ------------------ #
 def compute_reward(detector, tokenizer, texts):
     detector.eval()
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).to(DEVICE)
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
+                       max_length=tokenizer.model_max_length).to(DEVICE)
     with torch.no_grad():
         outputs = detector(**inputs)
     probs = torch.softmax(outputs.logits, dim=-1)
@@ -132,11 +135,48 @@ def normalize_rewards(rewards):
 # ------------------ PPO-style Updates ------------------ #
 def update_paraphraser(model, tokenizer, optimizer, xm, xp, adv):
     model.train()
-    inputs = tokenizer(xm, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).to(DEVICE)
-    targets = tokenizer(xp, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).input_ids.to(
-        DEVICE)
+    # tokenize source (xm)
+    inputs = tokenizer(
+        xm,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=min(MAX_LENGTH, tokenizer.model_max_length)
+    ).to(DEVICE)
+    # tokenize targets (xp)
+    with tokenizer.as_target_tokenizer():
+        targets = tokenizer(
+            xp,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=min(MAX_LENGTH, tokenizer.model_max_length)
+        ).input_ids.to(DEVICE)
+
+    # *** Modified: compute logits and per‐sample loss manually for DataParallel ***
     outputs = model(**inputs, labels=targets)
-    loss = -(outputs.loss * adv.to(DEVICE)).mean()
+    logits = outputs.logits  # [batch, seq_len, vocab_size]
+    vocab_size = logits.size(-1)
+
+    # Flatten logits/targets for token‐level CE, no reduction
+    loss_fct = nn.CrossEntropyLoss(
+        ignore_index=tokenizer.pad_token_id,
+        reduction="none"
+    )
+    flat_logits = logits.view(-1, vocab_size)  # [batch*seq_len, vocab_size]
+    flat_targets = targets.view(-1)  # [batch*seq_len]
+    flat_loss = loss_fct(flat_logits, flat_targets)  # [batch*seq_len]
+
+    # Reshape to [batch, seq_len] then average per sample
+    per_sample_loss = (
+        flat_loss
+        .view(targets.size(0), -1)
+        .mean(dim=1)
+    )  # [batch]
+
+    # Weight by adv and take final mean
+    loss = -(per_sample_loss * adv.to(DEVICE)).mean()
+
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
@@ -144,23 +184,34 @@ def update_paraphraser(model, tokenizer, optimizer, xm, xp, adv):
 
 def update_detector(detector, tokenizer, optimizer, xh, xm, xp):
     detector.train()
-    texts = xh + xm + xp
-    labels = torch.tensor([0] * len(xh) + [1] * len(xm) + [1] * len(xp)).to(DEVICE)
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
-                       max_length=min(MAX_LENGTH, tokenizer.model_max_length)).to(DEVICE)
-    # print(type(inputs), inputs)
-    # exit(0)
-    try:
-        outputs = detector(**inputs)
-    except RuntimeError:
-        print(inputs["input_ids"].size(), inputs["attention_mask"].size())
-        print(texts)
-        exit(0)
-    # outputs = detector(**inputs)
-    loss = nn.CrossEntropyLoss()(outputs.logits, labels)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    batch_size = len(xh)
+    texts_all = [t for triple in zip(xh, xm, xp) for t in triple]
+    labels_all = torch.tensor(
+        [lab for _ in range(batch_size) for lab in (0, 1, 1)],
+        dtype=torch.long,
+        device=DEVICE)
+    # texts = xh + xm + xp
+    # labels = torch.tensor([0] * len(xh) + [1] * len(xm) + [1] * len(xp)).to(DEVICE)
+
+    for i in range(3):
+        texts = texts_all[i * batch_size:(i + 1) * batch_size]
+        labels = labels_all[i * batch_size:(i + 1) * batch_size]
+        inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
+                           max_length=min(MAX_LENGTH, tokenizer.model_max_length)).to(DEVICE)
+        # print(type(inputs), inputs)
+        # exit(0)
+        try:
+            outputs = detector(**inputs)
+        except RuntimeError as e:
+            print(inputs["input_ids"].size(), inputs["attention_mask"].size())
+            print(texts)
+            traceback.print_exc()
+            exit(0)
+        # outputs = detector(**inputs)
+        loss = nn.CrossEntropyLoss()(outputs.logits, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
 
 # ------------------ Evaluation ------------------ #
@@ -168,7 +219,8 @@ def evaluate(detector, tokenizer, xh_val, xm_val):
     detector.eval()
     texts = xh_val + xm_val
     labels = [0] * len(xh_val) + [1] * len(xm_val)
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).to(DEVICE)
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
+                       max_length=tokenizer.model_max_length).to(DEVICE)
     with torch.no_grad():
         logits = detector(**inputs).logits
     probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
@@ -181,7 +233,11 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
     tokenizer_d = AutoTokenizer.from_pretrained(DETECTOR_MODEL)
 
     paraphraser = AutoModelForSeq2SeqLM.from_pretrained(PARAPHRASER_MODEL).to(DEVICE)
+    if GPU_IDS:
+        paraphraser = nn.DataParallel(paraphraser, device_ids=GPU_IDS)
     detector = AutoModelForSequenceClassification.from_pretrained(DETECTOR_MODEL, num_labels=2).to(DEVICE)
+    if GPU_IDS:
+        detector = nn.DataParallel(detector, device_ids=GPU_IDS)
 
     optimizer_p = optim.AdamW(paraphraser.parameters(), lr=2e-5)
     optimizer_d = optim.AdamW(detector.parameters(), lr=2e-5)
@@ -199,18 +255,15 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
     for epoch in range(epochs):
         buffer = []
         for xh, xm in tqdm(loader, desc=f"Epoch {epoch + 1}"):
-            inputs = tokenizer_p(xm, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer_p.model_max_length).to(
-                DEVICE)
-            paraphrased_ids = paraphraser.generate(**inputs, max_length=tokenizer_p.model_max_length)
+            inputs = tokenizer_p(xm, return_tensors="pt", padding=True, truncation=True,
+                                 max_length=tokenizer_p.model_max_length).to(DEVICE)
+            gen_model = paraphraser.module if isinstance(paraphraser, nn.DataParallel) else paraphraser
+            paraphrased_ids = gen_model.generate(**inputs, max_length=tokenizer_p.model_max_length)
+            # paraphrased_ids = paraphraser.generate(**inputs, max_length=tokenizer_p.model_max_length)
             xp_raw = tokenizer_p.batch_decode(paraphrased_ids, skip_special_tokens=True)
-
             if paraphraser_mode == "hybrid":
-                # print(">>", xp_raw)
                 xp = backtranslate(xp_raw)
                 xp = paraphrase(xp)
-                # print(">>", xp)
-                # exit(0)
-                # xp = [insert_filler(x) for x in xp_bt]
             elif paraphraser_mode == "bt":
                 xp = backtranslate(xp_raw)
             elif paraphraser_mode == "lex":
@@ -233,10 +286,16 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
             best_detector = detector.state_dict()
             best_paraphraser = paraphraser.state_dict()
 
-        utils.save_torch_model(detector, optimizer_d, epoch=epoch,
-                               fname=f"saved_models/detector_{PARAPHRASER_MODE}_{N_SENTENCES}_{MAX_LENGTH}_{epoch}.pth")
-        utils.save_torch_model(paraphraser, optimizer_p, epoch=epoch,
-                               fname=f"saved_models/paraphraser_{PARAPHRASER_MODE}_{N_SENTENCES}_{MAX_LENGTH}_{epoch}.pth")
+        torch.cuda.empty_cache()
+
+        utils.save_torch_model(
+            detector.module if isinstance(detector, nn.DataParallel) else detector,
+            optimizer_d, epoch=epoch,
+            fname=f"saved_models/detector_{PARAPHRASER_MODE}_{N_SENTENCES}_{MAX_LENGTH}_{epoch}.pth")
+        utils.save_torch_model(
+            paraphraser.module if isinstance(detector, nn.DataParallel) else paraphraser,
+            optimizer_p, epoch=epoch,
+            fname=f"saved_models/paraphraser_{PARAPHRASER_MODE}_{N_SENTENCES}_{MAX_LENGTH}_{epoch}.pth")
 
     if best_detector and best_paraphraser:
         detector.load_state_dict(best_detector)
