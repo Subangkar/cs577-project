@@ -1,3 +1,4 @@
+import pickle
 import warnings
 
 import utils
@@ -39,13 +40,13 @@ MODEL_CONFIG = {
 TARGET_LLM = MODEL_CONFIG["t5"]
 PARAPHRASER_MODEL = "t5-small"
 DETECTOR_MODEL = "distilbert-base-uncased"
-DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 PARAPHRASER_MODE = "vanilla"
 
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 N_EPOCHS = 20
-MAX_LENGTH = 1024
-N_SENTENCES = 5000
+MAX_LENGTH = 2048
+N_SENTENCES = 20000
 
 
 # ------------------ Dataset Class ------------------ #
@@ -92,15 +93,15 @@ bt_model_fr_en = MarianMTModel.from_pretrained(BT_FR_TO_EN).to(DEVICE)
 
 
 def backtranslate(texts):
-    inputs = bt_tokenizer_en_fr(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(
+    inputs = bt_tokenizer_en_fr(texts, return_tensors="pt", padding=True, truncation=True).to(
         DEVICE)
     with torch.no_grad():
-        translated = bt_model_en_fr.generate(**inputs, max_length=MAX_LENGTH)
+        translated = bt_model_en_fr.generate(**inputs, max_length=bt_tokenizer_en_fr.model_max_length)
     fr_texts = bt_tokenizer_en_fr.batch_decode(translated, skip_special_tokens=True)
-    inputs = bt_tokenizer_fr_en(fr_texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(
+    inputs = bt_tokenizer_fr_en(fr_texts, return_tensors="pt", padding=True, truncation=True).to(
         DEVICE)
     with torch.no_grad():
-        backtranslated = bt_model_fr_en.generate(**inputs, max_length=MAX_LENGTH)
+        backtranslated = bt_model_fr_en.generate(**inputs, max_length=bt_tokenizer_fr_en.model_max_length)
     en_texts = bt_tokenizer_fr_en.batch_decode(backtranslated, skip_special_tokens=True)
     return en_texts
 
@@ -117,7 +118,7 @@ def insert_filler(text):
 # ------------------ Reward Calculation ------------------ #
 def compute_reward(detector, tokenizer, texts):
     detector.eval()
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(DEVICE)
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).to(DEVICE)
     with torch.no_grad():
         outputs = detector(**inputs)
     probs = torch.softmax(outputs.logits, dim=-1)
@@ -131,8 +132,8 @@ def normalize_rewards(rewards):
 # ------------------ PPO-style Updates ------------------ #
 def update_paraphraser(model, tokenizer, optimizer, xm, xp, adv):
     model.train()
-    inputs = tokenizer(xm, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(DEVICE)
-    targets = tokenizer(xp, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).input_ids.to(
+    inputs = tokenizer(xm, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).to(DEVICE)
+    targets = tokenizer(xp, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).input_ids.to(
         DEVICE)
     outputs = model(**inputs, labels=targets)
     loss = -(outputs.loss * adv.to(DEVICE)).mean()
@@ -145,16 +146,17 @@ def update_detector(detector, tokenizer, optimizer, xh, xm, xp):
     detector.train()
     texts = xh + xm + xp
     labels = torch.tensor([0] * len(xh) + [1] * len(xm) + [1] * len(xp)).to(DEVICE)
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(DEVICE)
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
+                       max_length=min(MAX_LENGTH, tokenizer.model_max_length)).to(DEVICE)
     # print(type(inputs), inputs)
     # exit(0)
-    # try:
-    #     outputs = detector(**inputs)
-    # except RuntimeError:
-    #     print(inputs["input_ids"].size(), inputs["attention_mask"].size())
-    #     print(texts)
-    #     exit(0)
-    outputs = detector(**inputs)
+    try:
+        outputs = detector(**inputs)
+    except RuntimeError:
+        print(inputs["input_ids"].size(), inputs["attention_mask"].size())
+        print(texts)
+        exit(0)
+    # outputs = detector(**inputs)
     loss = nn.CrossEntropyLoss()(outputs.logits, labels)
     optimizer.zero_grad()
     loss.backward()
@@ -166,7 +168,7 @@ def evaluate(detector, tokenizer, xh_val, xm_val):
     detector.eval()
     texts = xh_val + xm_val
     labels = [0] * len(xh_val) + [1] * len(xm_val)
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(DEVICE)
+    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer.model_max_length).to(DEVICE)
     with torch.no_grad():
         logits = detector(**inputs).logits
     probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
@@ -197,18 +199,22 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
     for epoch in range(epochs):
         buffer = []
         for xh, xm in tqdm(loader, desc=f"Epoch {epoch + 1}"):
-            inputs = tokenizer_p(xm, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LENGTH).to(
+            inputs = tokenizer_p(xm, return_tensors="pt", padding=True, truncation=True, max_length=tokenizer_p.model_max_length).to(
                 DEVICE)
-            paraphrased_ids = paraphraser.generate(**inputs, max_length=MAX_LENGTH)
+            paraphrased_ids = paraphraser.generate(**inputs, max_length=tokenizer_p.model_max_length)
             xp_raw = tokenizer_p.batch_decode(paraphrased_ids, skip_special_tokens=True)
 
             if paraphraser_mode == "hybrid":
                 # print(">>", xp_raw)
-                xp = paraphrase(xp_raw)
+                xp = backtranslate(xp_raw)
+                xp = paraphrase(xp)
                 # print(">>", xp)
                 # exit(0)
-                # xp_bt = backtranslate(xp_raw)
                 # xp = [insert_filler(x) for x in xp_bt]
+            elif paraphraser_mode == "bt":
+                xp = backtranslate(xp_raw)
+            elif paraphraser_mode == "lex":
+                xp = paraphrase(xp_raw)
             else:
                 xp = xp_raw
 
@@ -241,7 +247,7 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
 # ------------------ Entry Point ------------------ #
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--paraphraser_mode", choices=["vanilla", "hybrid"], default="vanilla",
+    parser.add_argument("--paraphraser_mode", choices=["vanilla", "lex", "bt", "hybrid"], default="vanilla",
                         help="Choose paraphraser type")
     args = parser.parse_args()
 
@@ -249,27 +255,31 @@ if __name__ == '__main__':
 
     print(DEVICE)
 
-    print("Loading WebText subset...")
-    dataset = load_dataset("openwebtext", split="train[:1%]")
-    print(len(dataset))
-    texts = [item['text'] for item in dataset if
-             len(item['text']) < MAX_LENGTH and not utils.contains_non_english_letter(item['text'])]
+    # print("Loading WebText subset...")
+    # dataset = load_dataset("openwebtext", split="train[:1%]")
+    # print(len(dataset))
+    # texts = [item['text'] for item in dataset if
+    #          len(item['text']) < MAX_LENGTH and not utils.contains_non_english_letter(item['text'])]
+    with open("texts.pkl", "rb") as f:
+        texts = pickle.load(f)
 
     N_SENTENCES = min(N_SENTENCES, len(texts))
     texts = texts[:N_SENTENCES]
     # texts = texts[:481] + texts[483:5002]
 
-    ai_corpus = generate_ai_corpus(texts, TARGET_LLM)
+    # ai_corpus = generate_ai_corpus(texts, TARGET_LLM)
+    with open(f"ai_corpus_{N_SENTENCES}.pkl", "rb") as f:
+        ai_corpus = pickle.load(f)
 
     # print(">>", texts[:5])
     # print(">>", ai_corpus[:5])
 
     # print(texts)
     # Save to a text file
-    # with open("human_texts.txt", "w") as f:
-    #     for line in texts:
-    #         f.write("\n>> " + line.strip().replace("\n", " "))  # Add newline after each string
-    # with open("ai_texts.txt", "w") as f:
-    #     for line in ai_corpus:
-    #         f.write("\n>> " + line)  # Add newline after each string
+    with open("human_texts.txt", "w") as f:
+        for line in texts:
+            f.write("\n>> " + line.strip().replace("\n", " "))  # Add newline after each string
+    with open("ai_texts.txt", "w") as f:
+        for line in ai_corpus:
+            f.write("\n>> " + line)  # Add newline after each string
     detector, paraphraser = train_radar(texts, ai_corpus, epochs=N_EPOCHS, paraphraser_mode=args.paraphraser_mode)

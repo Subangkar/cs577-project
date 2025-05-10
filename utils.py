@@ -23,3 +23,26 @@ def save_torch_model(model, optimizer, epoch, fname):
         "epoch": epoch,
         # "loss": loss,
     }, fname)
+
+
+import unicodedata
+import regex
+
+# Compile once: anything NOT in Basic Latin block, nor Punctuation, nor Symbols, nor whitespace
+_non_english_re = regex.compile(r'(?V1)[^\p{Block=BasicLatin}\p{P}\p{S}\s]')
+
+def contains_non_english_char(s: str) -> bool:
+    """
+    Returns True if s contains any character that is NOT
+     - an ASCII-range character (Basic Latin block: U+0000–U+007F),
+     - punctuation (\p{P}),
+     - symbol (\p{S}), or
+     - whitespace (\s).
+    That effectively treats A–Z/a–z, digits, ASCII punctuation,
+    all Unicode punctuation, all symbols/emoji, and spaces/tabs/newlines
+    as 'allowed', and flags everything else.
+    """
+    # 1) normalize to NFC so composed characters stay together
+    s = unicodedata.normalize("NFC", s)
+    # 2) search for any disallowed char
+    return bool(_non_english_re.search(s))
