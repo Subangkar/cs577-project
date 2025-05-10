@@ -45,10 +45,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 GPU_IDS = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
 PARAPHRASER_MODE = "vanilla"
 
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 N_EPOCHS = 20
 MAX_LENGTH = 2048
-N_SENTENCES = 500
+N_SENTENCES = 20000
 
 
 # ------------------ Dataset Class ------------------ #
@@ -217,14 +217,18 @@ def update_detector(detector, tokenizer, optimizer, xh, xm, xp):
 # ------------------ Evaluation ------------------ #
 def evaluate(detector, tokenizer, xh_val, xm_val):
     detector.eval()
-    texts = xh_val + xm_val
+    probs_all = []
+    # texts = xh_val + xm_val
     labels = [0] * len(xh_val) + [1] * len(xm_val)
-    inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
-                       max_length=tokenizer.model_max_length).to(DEVICE)
-    with torch.no_grad():
-        logits = detector(**inputs).logits
-    probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
-    return roc_auc_score(labels, probs)
+
+    for texts in [xh_val, xm_val]:
+        inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
+                           max_length=tokenizer.model_max_length).to(DEVICE)
+        with torch.no_grad():
+            logits = detector(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
+        probs_all.append(probs)
+    return roc_auc_score(labels, np.concatenate(probs_all))
 
 
 # ------------------ Training Loop ------------------ #
@@ -254,7 +258,7 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
     print(">>", epochs)
     for epoch in range(epochs):
         buffer = []
-        for xh, xm in tqdm(loader, desc=f"Epoch {epoch + 1}"):
+        for xh, xm in tqdm(loader, desc=f"Epoch {epoch + 1}/{N_EPOCHS}"):
             inputs = tokenizer_p(xm, return_tensors="pt", padding=True, truncation=True,
                                  max_length=tokenizer_p.model_max_length).to(DEVICE)
             gen_model = paraphraser.module if isinstance(paraphraser, nn.DataParallel) else paraphraser
@@ -275,7 +279,7 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
             adv = normalize_rewards(rewards)
             buffer.append((list(xh), list(xm), xp, adv))
 
-        for xh, xm, xp, adv in buffer:
+        for xh, xm, xp, adv in tqdm(buffer, desc=f"Epoch {epoch + 1}/{N_EPOCHS} Updating"):
             update_paraphraser(paraphraser, tokenizer_p, optimizer_p, xm, xp, adv)
             update_detector(detector, tokenizer_d, optimizer_d, xh, xm, xp)
 
