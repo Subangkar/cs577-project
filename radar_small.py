@@ -45,10 +45,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 GPU_IDS = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
 PARAPHRASER_MODE = "vanilla"
 
-BATCH_SIZE = 64
-N_EPOCHS = 20
+BATCH_SIZE = 16
+N_EPOCHS = 8
 MAX_LENGTH = 2048
-N_SENTENCES = 20000
+N_SENTENCES = 10000
 
 
 # ------------------ Dataset Class ------------------ #
@@ -233,8 +233,8 @@ def evaluate(detector, tokenizer, xh_val, xm_val):
 
 # ------------------ Training Loop ------------------ #
 def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
-    tokenizer_p = AutoTokenizer.from_pretrained(PARAPHRASER_MODEL)
-    tokenizer_d = AutoTokenizer.from_pretrained(DETECTOR_MODEL)
+    tokenizer_p = AutoTokenizer.from_pretrained(PARAPHRASER_MODEL, use_fast=True)
+    tokenizer_d = AutoTokenizer.from_pretrained(DETECTOR_MODEL, use_fast=True)
 
     paraphraser = AutoModelForSeq2SeqLM.from_pretrained(PARAPHRASER_MODEL).to(DEVICE)
     if GPU_IDS:
@@ -279,18 +279,22 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
             adv = normalize_rewards(rewards)
             buffer.append((list(xh), list(xm), xp, adv))
 
+        # torch.cuda.empty_cache()
+
         for xh, xm, xp, adv in tqdm(buffer, desc=f"Epoch {epoch + 1}/{N_EPOCHS} Updating"):
             update_paraphraser(paraphraser, tokenizer_p, optimizer_p, xm, xp, adv)
             update_detector(detector, tokenizer_d, optimizer_d, xh, xm, xp)
 
+        # torch.cuda.empty_cache()
+
         auc = evaluate(detector, tokenizer_d, xh_val, xm_val)
         print(f"Validation AUROC: {auc:.4f}")
-        if auc > best_auc:
-            best_auc = auc
-            best_detector = detector.state_dict()
-            best_paraphraser = paraphraser.state_dict()
+        # if auc > best_auc:
+        #     best_auc = auc
+        #     best_detector = detector.state_dict()
+        #     best_paraphraser = paraphraser.state_dict()
 
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
         utils.save_torch_model(
             detector.module if isinstance(detector, nn.DataParallel) else detector,
@@ -301,9 +305,9 @@ def train_radar(human_texts, ai_texts, epochs=2, paraphraser_mode="vanilla"):
             optimizer_p, epoch=epoch,
             fname=f"saved_models/paraphraser_{PARAPHRASER_MODE}_{N_SENTENCES}_{MAX_LENGTH}_{epoch}.pth")
 
-    if best_detector and best_paraphraser:
-        detector.load_state_dict(best_detector)
-        paraphraser.load_state_dict(best_paraphraser)
+    # if best_detector and best_paraphraser:
+    #     detector.load_state_dict(best_detector)
+    #     paraphraser.load_state_dict(best_paraphraser)
     return detector, paraphraser
 
 
