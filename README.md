@@ -72,6 +72,10 @@ Recent advancements in large language models (LLMs) have made it increasingly di
 ```bash
 git clone https://github.com/Subangkar/cs577-project.git
 cd cs577-project
+
+python3 -m venv venv
+source venv/bin/activate  # On Windows use: venv\Scripts\activate
+
 pip install -r requirements.txt
 ```
 
